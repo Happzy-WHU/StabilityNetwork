@@ -1,0 +1,220 @@
+# -*- coding: utf-8 -*-
+import os
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import torchvision.transforms as transforms
+import torch.optim as optim
+import torchvision
+# import resnet.resnet as resnet
+import joint
+import foolbox
+import numpy as np
+import torchvision.models as models
+import getAdver
+
+BASEDIR = os.path.dirname(os.path.abspath(__file__))
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # 设置模型训练的设备
+
+print("use device :{}".format(device))
+
+
+# 参数设置
+MAX_EPOCH = 3
+BATCH_SIZE = 64 #64
+LR = 0.01
+log_interval = 10
+val_interval = 1
+classes = 10 #类的数量，不可改
+start_epoch = 0 #本质上和改Max_EPOCH等价
+lr_decay_rate = 0.1
+lr_decay_step = 60   #每60次迭代将学习率乘以0.1
+describe = "new"
+
+#<editor-fold desc="step 1/5 数据">
+norm_mean = [0.4914, 0.4822, 0.4465]
+norm_std = [0.2023, 0.1994, 0.2010]
+transform_train = transforms.Compose([
+    transforms.RandomCrop(32, padding=4),  #先四周填充0，在吧图像随机裁剪成32*32
+    transforms.RandomHorizontalFlip(),  #图像一半的概率翻转，一半的概率不翻转
+    transforms.ToTensor(),
+    transforms.Normalize(norm_mean, norm_std), #R,G,B每层的归一化用到的均值和方差
+])
+
+transform_test = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(norm_mean, norm_std),
+])
+
+trainset = torchvision.datasets.CIFAR10\
+    (root='./data', train=True, download=True, transform=transform_train) #训练数据集
+train_loader = torch.utils.data.DataLoader\
+    (trainset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)   #生成一个个batch进行批训练，组成batch的时候顺序打乱取
+
+testset = torchvision.datasets.CIFAR10\
+    (root='./data', train=False, download=True, transform=transform_test)
+valid_loader = torch.utils.data.DataLoader\
+    (testset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+
+
+# 2/3 加载参数
+# flag = 0
+
+
+# Cifar-10的标签
+classes_detail = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+#</editor-fold>
+
+#<editor-fold desc="step 3/5 损失函数">
+
+criterion = nn.CrossEntropyLoss()                                                   # 选择损失函数
+
+#</editor-fold>
+
+#<editor-fold desc="step 4/5 优化器">
+
+def getScheduler(model):
+    optimizer = optim.Adam(model.parameters(), lr=LR, betas=(0.9,0.99))  # 选择优化器
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=lr_decay_step, gamma=lr_decay_rate)  # 设置学习率下降策略
+    return optimizer,scheduler
+
+#</editor-fold>
+
+#<editor-fold desc="step 5/5 训练">
+
+new_model = joint.CNN()
+flag = 1
+if flag:
+    path_pretrained_model = os.path.join(BASEDIR, "models/cifar10_models/first.pth")
+    state_dict_load = torch.load(path_pretrained_model)
+    new_model.load_state_dict(state_dict_load)
+
+new_model = new_model.cuda()
+NetList = joint.build_model()
+
+optimizer, scheduler = getScheduler(new_model)
+def train_new():
+    train_curve = list()
+    valid_curve = list()
+
+    for epoch in range(start_epoch + 1, MAX_EPOCH):
+        loss_mean = 0.
+        correct = 0.
+        total = 0.
+        new_model.train()
+        for i, data in enumerate(train_loader):
+
+            # forward
+            inputs, labels = data
+            inputs, labels = inputs.to(device), labels.to(device)  # 训练数据也要放到设置的设备上
+            midDataList = []
+            for n in NetList:
+                with torch.no_grad():
+                    midDataList.append(n(inputs))
+            input_newTensor = torch.stack(midDataList , 2)
+            outputs = new_model(input_newTensor)
+
+
+
+            # backward
+            optimizer.zero_grad()
+            loss = criterion(outputs, labels)
+            loss.backward()
+
+            # update weights
+            optimizer.step()
+
+            # 统计分类情况
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).squeeze().cpu().sum().numpy()
+
+            # 打印训练信息
+            loss_mean += loss.item()
+            train_curve.append(loss.item())
+            if (i + 1) % log_interval == 0:
+                loss_mean = loss_mean / log_interval
+                print("Training:Epoch[{:0>3}/{:0>3}] Iteration[{:0>3}/{:0>3}] Loss: {:.4f} Acc:{:.2%}".format(
+                    epoch, MAX_EPOCH, i + 1, len(train_loader), loss_mean, correct / total))
+                loss_mean = 0.
+
+                # if flag_m1:
+                # print("epoch:{} conv1.weights[0, 0, ...] :\n {}".format(epoch, resnet18_ft.conv1.weight[0, 0, ...]))
+
+        scheduler.step()  # 更新学习率
+
+        # validate the model
+        if (epoch + 1) % val_interval == 0:
+
+            correct_val = 0.
+            total_val = 0.
+            loss_val = 0.
+            new_model.eval()
+            with torch.no_grad():
+                for j, data in enumerate(valid_loader):
+                    inputs, labels = data
+                    inputs, labels = inputs.to(device), labels.to(device)
+                    dataList = []
+                    for n in NetList:
+                        with torch.no_grad():
+                            dataList.append(n(inputs))
+                    input_val_Tensor = torch.stack(dataList, 2)
+                    outputs = new_model(input_val_Tensor)
+                    loss = criterion(outputs, labels)
+
+                    _, predicted = torch.max(outputs.data, 1)
+                    total_val += labels.size(0)
+                    correct_val += (predicted == labels).squeeze().cpu().sum().numpy()
+
+                    loss_val += loss.item()
+
+                loss_val_mean = loss_val / len(valid_loader)
+                valid_curve.append(loss_val_mean)
+                print("Valid:\t Epoch[{:0>3}/{:0>3}] Iteration[{:0>3}/{:0>3}] Loss: {:.4f} Acc:{:.2%}".format(
+                    epoch, MAX_EPOCH, j + 1, len(valid_loader), loss_val_mean, correct_val / total_val))
+            new_model.train()
+    return new_model
+
+
+def outToIn(images):
+    l2=[]
+    for n in NetList:
+        l1 = []
+        for i in images:
+            l1.append(torch.Tensor(i))
+        t1 = torch.stack(l1 ,0)     #16
+        t1 = t1.to(device)
+        # with torch.no_grad:
+        l2.append(n(t1))
+    t2 = torch.stack(l2, 2)
+    return t2
+
+def testNewModel(images, labels, model):
+    imTensor = outToIn(images)
+    total_val = 16
+    correct_val = 0.0
+    output = model(imTensor)
+    _, predicted = torch.max(output.data, 1)
+    predicted_new = predicted.cpu().numpy()
+    for i in range(0,16):
+        if labels[i]==predicted_new[i]:
+            correct_val += 1
+    if predicted == labels:
+        correct_val += 1
+    return correct_val/total_val
+
+
+if __name__ == "__main__":
+    model_new = train_new()
+    model = models.resnet18(False).eval()
+    model.fc = nn.Linear(model.fc.in_features,10)
+    preprocessing = dict(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], axis=-3)
+    fmodel = foolbox.models.PyTorchModel(model, bounds=(0, 1), num_classes=10, preprocessing=preprocessing)
+
+    # get a batch of images and labels and print the accuracy
+    images, labels = foolbox.utils.samples(dataset='cifar10', batchsize=16, data_format='channels_first',
+                                           bounds=(0, 1))
+    print(testNewModel(images, labels, model_new))
+    # -> 0.9375
+
+    print(testNewModel(getAdver.GetA(), labels, model_new))
